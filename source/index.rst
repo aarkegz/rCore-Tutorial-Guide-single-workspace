@@ -1,9 +1,9 @@
-.. rCore-Tutorial-Guide-2025S documentation master file, created by
+.. rCore-Tutorial-Guide documentation master file, created by
    sphinx-quickstart on Thu Oct 29 22:25:54 2020.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-rCore-Tutorial-Guide 2025 春季学期
+rCore-Tutorial-Guide
 ==================================================
 
 .. toctree::
@@ -45,7 +45,7 @@ rCore-Tutorial-Guide 2025 春季学期
 
 本教程展示了如何 **从零开始** 用 **Rust** 语言写一个基于 **RISC-V** 架构的 **类 Unix 内核** 。
 
-用于 2025 年春季学期操作系统课堂教学。
+用于操作系统课堂教学。
 
 导读
 ---------------------
