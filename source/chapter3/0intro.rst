@@ -16,122 +16,158 @@
 实践体验
 -------------------------------------
 
-.. code-block:: console
-
-   $ git clone https://github.com/LearningOS/rCore-Tutorial-Code.git
-   $ cd rCore-Tutorial-Code
-   $ git checkout ch3
-   $ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
-
-在 qemu 模拟器上运行本章代码：
+在 ``rCore-Tutorial-in-single-workspace`` 项目中运行本章代码（ ``DEBUG`` 类型的调试输出过多，建议使用 ``LOG=INFO`` 过滤输出）：
 
 .. code-block:: console
+   $ LOG=INFO cargo qemu --ch 3
 
-   $ cd os
-   $ make run
-
-运行代码，看到用户程序交替输出信息：
+运行后，看到用户程序交替输出信息：
 
 .. code-block::
 
-   [rustsbi] RustSBI version 0.2.0-alpha.4
+   [rustsbi] RustSBI version 0.3.1, adapting to RISC-V SBI v1.0.0
    .______       __    __      _______.___________.  _______..______   __
    |   _  \     |  |  |  |    /       |           | /       ||   _  \ |  |
    |  |_)  |    |  |  |  |   |   (----`---|  |----`|   (----`|  |_)  ||  |
    |      /     |  |  |  |    \   \       |  |      \   \    |   _  < |  |
    |  |\  \----.|  `--'  |.----)   |      |  |  .----)   |   |  |_)  ||  |
    | _| `._____| \______/ |_______/       |__|  |_______/    |______/ |__|
+   [rustsbi] Implementation     : RustSBI-QEMU Version 0.2.0-alpha.2
+   [rustsbi] Platform Name      : riscv-virtio,qemu
+   [rustsbi] Platform SMP       : 1
+   [rustsbi] Platform Memory    : 0x80000000..0x84000000
+   [rustsbi] Boot HART          : 0
+   [rustsbi] Device Tree Region : 0x83e00000..0x83e010f6
+   [rustsbi] Firmware Address   : 0x80000000
+   [rustsbi] Supervisor Address : 0x80200000
+   [rustsbi] pmp01: 0x00000000..0x80000000 (-wr)
+   [rustsbi] pmp02: 0x80000000..0x80200000 (---)
+   [rustsbi] pmp03: 0x80200000..0x84000000 (xwr)
+   [rustsbi] pmp04: 0x84000000..0x00000000 (-wr)
 
-   [rustsbi] Implementation: RustSBI-QEMU Version 0.0.1
-   [rustsbi-dtb] Hart count: cluster0 with 1 cores
-   [rustsbi] misa: RV64ACDFIMSU
-   [rustsbi] mideleg: ssoft, stimer, sext (0x222)
-   [rustsbi] medeleg: ima, ia, bkpt, la, sa, uecall, ipage, lpage, spage (0xb1ab)
-   [rustsbi] pmp0: 0x80000000 ..= 0x800fffff (rwx)
-   [rustsbi] pmp1: 0x80000000 ..= 0x807fffff (rwx)
-   [rustsbi] pmp2: 0x0 ..= 0xffffffffffffff (---)
-   [rustsbi] enter supervisor 0x80200000
-   [kernel] Hello, world!
+      ______                       __
+   / ____/___  ____  _________  / /__
+   / /   / __ \/ __ \/ ___/ __ \/ / _ \
+   / /___/ /_/ / / / (__  ) /_/ / /  __/
+   \____/\____/_/ /_/____/\____/_/\___/
+   ====================================
+   [ INFO] LOG TEST >> Hello, world!
+   [ WARN] LOG TEST >> Hello, world!
+   [ERROR] LOG TEST >> Hello, world!
+
+   [ INFO] load app0 to 0x80400000
+   [ INFO] load app1 to 0x80600000
+   [ INFO] load app2 to 0x80800000
+   [ INFO] load app3 to 0x80a00000
+   [ INFO] load app4 to 0x80c00000
+   [ INFO] load app5 to 0x80e00000
+   [ INFO] load app6 to 0x81000000
+   [ INFO] load app7 to 0x81200000
+   [ INFO] load app8 to 0x81400000
+   [ INFO] load app9 to 0x81600000
+   [ INFO] load app10 to 0x81800000
+   [ INFO] load app11 to 0x81a00000
+
+   Hello, world from user mode program!
+   [ INFO] app0 exit with code 0
+   Into Test store_fault, we will insert an invalid store operation...
+   Kernel should kill this application!
+   [ERROR] app1 was killed by StoreFault
+   Try to execute privileged instruction in U Mode
+   Kernel should kill this application!
+   [ERROR] app3 was killed by IllegalInstruction
+   Try to access privileged CSR in U Mode
+   Kernel should kill this application!
+   [ERROR] app4 was killed by IllegalInstruction
+   AAAAAAAAAA [1/5]
+   BBBBBBBBBB [1/2]
+   AAAAAAAAAA [2/5]
+   BBBBBBBBBB [2/2]
+   CCCCCCCCCC [1/3]
+   3^10000=5079(MOD 10007)
+   AAAAAAAAAA [3/5]
+   Test write B OK!
+   [ INFO] app6 exit with code 0
+   CCCCCCCCCC [2/3]
    power_3 [10000/200000]
+   power_5 [10000/140000]
+   power_7 [10000/160000]
+   3^20000=8202(MOD 10007)
+   AAAAAAAAAA [4/5]
+   CCCCCCCCCC [3/3]
    power_3 [20000/200000]
+   power_5 [20000/140000]
+   power_7 [20000/160000]
+   3^30000=8824(MOD 10007)
+   AAAAAAAAAA [5/5]
+   Test write C OK!
+   [ INFO] app7 exit with code 0
    power_3 [30000/200000]
+   power_5 [30000/140000]
+   power_7 [30000/160000]
+   3^40000=5750(MOD 10007)
+   Test write A OK!
+   [ INFO] app5 exit with code 0
    power_3 [40000/200000]
+   power_5 [40000/140000]
+   power_7 [40000/160000]
+   3^50000=3824(MOD 10007)
    power_3 [50000/200000]
+   power_5 [50000/140000]
+   power_7 [50000/160000]
+   3^60000=8516(MOD 10007)
    power_3 [60000/200000]
+   power_5 [60000/140000]
+   power_7 [60000/160000]
+   3^70000=2510(MOD 10007)
    power_3 [70000/200000]
+   power_5 [70000/140000]
+   power_7 [70000/160000]
+   3^80000=9379(MOD 10007)
    power_3 [80000/200000]
+   power_5 [80000/140000]
+   power_7 [80000/160000]
+   3^90000=2621(MOD 10007)
    power_3 [90000/200000]
+   power_5 [90000/140000]
+   power_7 [90000/160000]
+   3^100000=2749(MOD 10007)
+   Test power OK!
+   [ INFO] app2 exit with code 0
    power_3 [100000/200000]
+   power_5 [100000/140000]
+   power_7 [100000/160000]
    power_3 [110000/200000]
+   power_5 [110000/140000]
+   power_7 [110000/160000]
    power_3 [120000/200000]
+   power_5 [120000/140000]
+   power_7 [120000/160000]
    power_3 [130000/200000]
+   power_5 [130000/140000]
+   power_7 [130000/160000]
    power_3 [140000/200000]
+   power_5 [140000/140000]
+   5^140000 = 386471875(MOD 998244353)
+   Test power_5 OK!
+   [ INFO] app9 exit with code 0
+   power_7 [140000/160000]
    power_3 [150000/200000]
+   power_7 [150000/160000]
    power_3 [160000/200000]
+   power_7 [160000/160000]
+   7^160000 = 667897727(MOD 998244353)
+   Test power_7 OK!
+   [ INFO] app10 exit with code 0
    power_3 [170000/200000]
    power_3 [180000/200000]
    power_3 [190000/200000]
    power_3 [200000/200000]
    3^200000 = 871008973(MOD 998244353)
    Test power_3 OK!
-   power_5 [10000/140000]
-   power_5 [20000/140000]
-   power_5 [30000/140000]
-   power_5 [40000/140000]
-   power_5 [50000/140000]
-   power_5 [60000/140000]
-   power_7 [10000/160000]
-   power_7 [20000/160000]
-   power_7 [30000/160000]
-   power_7 [40000/160000]
-   power_7 [50000/160000]
-   power_7 [60000/160000]
-   power_7 [70000/160000]
-   power_7 [80000/160000]
-   power_7 [90000/160000]
-   power_7 [100000/160000]
-   power_7 [110000/160000]
-   power_7 [120000/160000]
-   power_7 [130000/160000]
-   power_7 [140000/160000]
-   power_7 [150000/160000]
-   power_7 [160000/160000]
-   7^160000 = 667897727(MOD 998244353)
-   Test power_7 OK!
-   get_time OK! 42
-   current time_msec = 42
-   AAAAAAAAAA [1/5]
-   BBBBBBBBBB [1/5]
-   CCCCCCCCCC [1/5]
-   power_5 [70000/140000]
-   AAAAAAAAAA [2/5]
-   BBBBBBBBBB [2/5]
-   CCCCCCCCCC [2/5]
-   power_5 [80000/140000]
-   power_5 [90000/140000]
-   power_5 [100000/140000]
-   power_5 [110000/140000]
-   power_5 [120000/140000]
-   power_5 [130000/140000]
-   power_5 [140000/140000]
-   5^140000 = 386471875(MOD 998244353)
-   Test power_5 OK!
-   AAAAAAAAAA [3/5]
-   BBBBBBBBBB [3/5]
-   CCCCCCCCCC [3/5]
-   AAAAAAAAAA [4/5]
-   BBBBBBBBBB [4/5]
-   CCCCCCCCCC [4/5]
-   AAAAAAAAAA [5/5]
-   BBBBBBBBBB [5/5]
-   CCCCCCCCCC [5/5]
-   Test write A OK!
-   Test write B OK!
-   Test write C OK!
-   time_msec = 143 after sleeping 100 ticks, delta = 101ms!
-   Test sleep1 passed!
+   [ INFO] app8 exit with code 0
    Test sleep OK!
-   Panicked at src/task/mod.rs:98 All applications completed!
+   [ INFO] app11 exit with code 0
 
 
 本章代码树
@@ -139,50 +175,19 @@
 
 .. code-block::
 
-   ── os
-      ├── build.rs
-      ├── Cargo.toml
-      ├── Makefile
-      └── src
-          ├── batch.rs(移除：功能分别拆分到 loader 和 task 两个子模块)
-          ├── config.rs(新增：保存内核的一些配置)
-          ├── console.rs
-          ├── logging.rs
-          ├── sync
-          ├── entry.asm
-          ├── lang_items.rs
-          ├── link_app.S
-          ├── linker.ld
-          ├── loader.rs(新增：将应用加载到内存并进行管理)
-          ├── main.rs(修改：主函数进行了修改)
-          ├── sbi.rs(修改：引入新的 sbi call set_timer)
-          ├── syscall(修改：新增若干 syscall)
-          │   ├── fs.rs
-          │   ├── mod.rs
-          │   └── process.rs
-          ├── task(新增：task 子模块，主要负责任务管理)
-          │   ├── context.rs(引入 Task 上下文 TaskContext)
-          │   ├── mod.rs(全局任务管理器和提供给其他模块的接口)
-          │   ├── switch.rs(将任务切换的汇编代码解释为 Rust 接口 __switch)
-          │   ├── switch.S(任务切换的汇编代码)
-          │   └── task.rs(任务控制块 TaskControlBlock 和任务状态 TaskStatus 的定义)
-          ├── timer.rs(新增：计时器相关)
-          └── trap
-              ├── context.rs
-              ├── mod.rs(修改：时钟中断相应处理)
-              └── trap.S
-
-   cloc os
-   -------------------------------------------------------------------------------
-   Language                     files          blank        comment           code
-   -------------------------------------------------------------------------------
-   Rust                            21             87             20            627
-   Assembly                         4             12             22            144
-   make                             1             11              4             36
-   TOML                             1              2              1             10
-   -------------------------------------------------------------------------------
-   SUM:                            27            112             47            817
-   -------------------------------------------------------------------------------
+   ├── ch3（内核实现）
+   │   ├── Cargo.toml（配置文件）
+   │   └── src（内核源代码）
+   │       ├── main.rs（内核主函数，包括系统调用接口实现）
+   │       └── task.rs（任务控制块）
+   ├── tg-syscall（系统调用模块）
+   │   └── src
+   │       ├── kernel/mod.rs（内核端系统调用接口定义，无需修改）
+   │       ├── user.rs（用户端系统调用，无需修改）
+   │       └── syscall.h.in（系统调用号，无需修改）
+   ├── user（用户程序）
+   │   └── src/bin（测试用例，无需修改）
+   ├── ...
 
 
 .. 本章代码导读

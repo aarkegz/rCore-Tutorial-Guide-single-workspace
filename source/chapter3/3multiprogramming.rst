@@ -6,7 +6,8 @@
 
 - 任务运行状态：未初始化、准备执行、正在执行、已退出
 - 任务控制块：维护任务状态和任务上下文
-- 任务相关系统调用：程序主动暂停 ``sys_yield`` 和主动退出 ``sys_exit``
+- 任务相关系统调用：程序主动暂停 ``sys_sched_yield`` 和主动退出 ``sys_exit``
+
 
 yield 系统调用
 -------------------------------------------------------------------------
@@ -16,11 +17,11 @@ yield 系统调用
 
 上图描述了一种多道程序执行的典型情况。其中横轴为时间线，纵轴为正在执行的实体。
 开始时，蓝色应用向外设提交了一个请求，外设随即开始工作，
-但是它要一段时间后才能返回结果。蓝色应用于是调用 ``sys_yield`` 交出 CPU 使用权，
+但是它要一段时间后才能返回结果。蓝色应用于是调用 ``sys_sched_yield`` 交出 CPU 使用权，
 内核让绿色应用继续执行。一段时间后 CPU 切换回蓝色应用，发现外设仍未返回结果，
-于是再次 ``sys_yield`` 。直到第二次切换回蓝色应用，外设才处理完请求，于是蓝色应用终于可以向下执行了。
+于是再次 ``sys_sched_yield`` 。直到第二次切换回蓝色应用，外设才处理完请求，于是蓝色应用终于可以向下执行了。
 
-我们还会遇到很多其他需要等待其完成才能继续向下执行的事件，调用 ``sys_yield`` 可以避免等待过程造成的资源浪费。
+我们还会遇到很多其他需要等待其完成才能继续向下执行的事件，调用 ``sys_sched_yield`` 可以避免等待过程造成的资源浪费。
 
 .. code-block:: rust
     :caption: 第三章新增系统调用（一）
@@ -28,290 +29,223 @@ yield 系统调用
     /// 功能：应用主动交出 CPU 所有权并切换到其他应用。
     /// 返回值：总是返回 0。
     /// syscall ID：124
-    fn sys_yield() -> isize;
+    fn sys_sched_yield() -> isize;
 
 用户库对应的实现和封装：
 
 .. code-block:: rust
     
-    // user/src/syscall.rs
+    // tg-syscall/src/user.rs
 
-    pub fn sys_yield() -> isize {
-        syscall(SYSCALL_YIELD, [0, 0, 0])
+    pub fn sched_yield() -> isize {
+        // SAFETY: 无参数系统调用
+        unsafe { syscall0(SyscallId::SCHED_YIELD) }
     }
 
-    // user/src/lib.rs
-    // yield 是 Rust 的关键字
-    pub fn yield_() -> isize { sys_yield() }
-
-下文介绍内核应如何实现该系统调用。
 
 任务控制块与任务运行状态
 ---------------------------------------------------------
 
-任务运行状态暂包括如下几种：
+由于第三章需要同时运行多个程序，我们不能再像第二章那样，把程序内的信息全堆在 ``main.rs`` 中了。于是，本章节新增了一个 ``task.rs`` 来统一管理每个程序各自的信息。这样的数据结构名为 **任务控制块** (Task Control Block) 。
 
 .. code-block:: rust
-    :linenos:
 
-    // os/src/task/task.rs
+    // ch3/src/task.rs
 
-    #[derive(Copy, Clone, PartialEq)]
-    pub enum TaskStatus {
-        UnInit, // 未初始化
-        Ready, // 准备运行
-        Running, // 正在运行
-        Exited, // 已退出
-    }
-
-任务状态外和任务上下文一并保存在名为 **任务控制块** (Task Control Block) 的数据结构中：
-
-.. code-block:: rust
-    :linenos:
-
-    // os/src/task/task.rs
-
-    #[derive(Copy, Clone)]
     pub struct TaskControlBlock {
-        pub task_status: TaskStatus,
-        pub task_cx: TaskContext,
+        ctx: LocalContext,
+        pub finish: bool,
+        stack: [usize; 256],
     }
 
 
-任务控制块非常重要。在内核中，它就是应用的管理单位。后面的章节我们还会不断向里面添加更多内容。
+它包含第二章提到的上下文、用户栈的信息，还新增了一个 ``pub finish: bool`` 用于标识当前任务是否以运行完成。此外，之前的上下文初始化移到了 ``TaskControlBlock::init(entry)`` 中，执行过程移到了 ``TaskControlBlock::execute()`` ，而处理 syscall 的流程则移动到 ``TaskControlBlock::handle_syscall()`` 中。
+
+有了这些封装之后，我们就可以将所有用户程序塞进一个数组里，用于之后的执行；
+
+.. code-block:: rust
+
+    // ch3/src/main.rs
+
+    // 任务控制块
+    let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
+    let mut index_mod = 0;
+    // 初始化
+    for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
+        let entry = app.as_ptr() as usize;
+        log::info!("load app{i} to {entry:#x}");
+        tcbs[i].init(entry);
+        index_mod += 1;
+    }
+
+任务控制块非常重要。在内核中，它就是应用的管理单位。后面的章节中它会化身为 ``struct Process`` ，并增加更多内容，不过这就是另一个故事了。
+
+实现 sys_sched_yield
+----------------------------------------------------------------------------
+
+这个系统调用并不需要对单个程序内部做任何操作，因此它的实现和 ``sys_exit`` 一样，直接按规范返回 0。
+
+.. code-block:: rust
+
+    // ch3/src/main.rs
+
+    impl Process for SyscallContext {
+        #[inline]
+        fn exit(&self, _caller: tg_syscall::Caller, _status: usize) -> isize {
+            0
+        }
+    }
+
+    impl Scheduling for SyscallContext {
+        #[inline]
+        fn sched_yield(&self, _caller: tg_syscall::Caller) -> isize {
+            0
+        }
+    }
+
+它和 ``sys_exit`` 的实际差别体现在 ``TaskControlBlock::handle_syscall()`` 中。任务控制块预先定义了几种“调度事件”，以此将 syscall 的执行结果返回给更上层的（接下来要介绍的）任务管理器。
+
+调度事件分别是：
+- ``None`` ， 表示处理了一个常规 Syscall；
+- ``Yield``，表示处理了一个 ``sys_sched_yield``；
+- ``Exit(usize)``，表示处理了一个 ``sys_exit``，并包含返回值；
+- ``UnsupportedSyscall(SyscallId)``，表示遇到本章节不支持的 syscall。
+
+.. code-block:: rust
+
+    // ch3/src/task.rs
+    /// 调度事件。
+    pub enum SchedulingEvent {
+        None,
+        Yield,
+        Exit(usize),
+        UnsupportedSyscall(SyscallId),
+    }
+
+    impl TaskControlBlock {
+    /// 处理系统调用，返回是否应该终止程序。
+    pub fn handle_syscall(&mut self) -> SchedulingEvent {
+        use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
+        use SchedulingEvent as Event;
+
+        let id = self.ctx.a(7).into();
+        let args = [ ... ];
+        match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
+            Ret::Done(ret) => match id {
+                Id::EXIT => Event::Exit(self.ctx.a(0)),
+                Id::SCHED_YIELD => {
+                    *self.ctx.a_mut(0) = ret as _;
+                    self.ctx.move_next();
+                    Event::Yield
+                }
+                _ => {
+                    *self.ctx.a_mut(0) = ret as _;
+                    self.ctx.move_next();
+                    Event::None
+                }
+            },
+            Ret::Unsupported(_) => Event::UnsupportedSyscall(id),
+        }
+    }
 
 任务管理器
 --------------------------------------
 
-内核需要一个全局的任务管理器来管理这些任务控制块：
-
-.. code-block:: rust
-
-    // os/src/task/mod.rs
-
-    pub struct TaskManager {
-        num_app: usize,
-        inner: UPSafeCell<TaskManagerInner>,
-    }
-
-    struct TaskManagerInner {
-        tasks: [TaskControlBlock; MAX_APP_NUM],
-        current_task: usize,
-    }
-
-这里用到了变量与常量分离的编程风格：字段 ``num_app`` 表示应用数目，它在 ``TaskManager`` 初始化后将保持不变；
-而包裹在 ``TaskManagerInner`` 内的任务控制块数组 ``tasks``，以及正在执行的应用编号 ``current_task`` 会在执行过程中变化。
-
-初始化 ``TaskManager`` 的全局实例 ``TASK_MANAGER``：
+内核需要一个全局的任务管理器来管理这些任务控制块，并根据它们执行时的结果进行调度。
+本章节比较偷懒，直接写在了 ``main.rs`` 中。它的外层框架如下
 
 .. code-block:: rust
     :linenos:
 
-    // os/src/task/mod.rs
+    // ch3/src/main.rs
 
-    lazy_static! {
-        pub static ref TASK_MANAGER: TaskManager = {
-            let num_app = get_num_app();
-            let mut tasks = [TaskControlBlock {
-                task_cx: TaskContext::zero_init(),
-                task_status: TaskStatus::UnInit,
-            }; MAX_APP_NUM];
-            for (i, t) in tasks.iter_mut().enumerate().take(num_app) {
-                t.task_cx = TaskContext::goto_restore(init_app_cx(i));
-                t.task_status = TaskStatus::Ready;
-            }
-            TaskManager {
-                num_app,
-                inner: unsafe {
-                    UPSafeCell::new(TaskManagerInner {
-                        tasks,
-                        current_task: 0,
-                    })
-                },
-            }
-        };
-    }
+    // 多道执行
+    let mut remain = index_mod;
+    let mut i = 0usize;
+    while remain > 0 {
+        let tcb = &mut tcbs[i];
+        if !tcb.finish {
+            loop {
+                #[cfg(not(feature = "coop"))]
+                tg_sbi::set_timer(time::read64() + 12500);
+                unsafe { tcb.execute() };
 
-- 第 5 行：调用 ``loader`` 子模块提供的 ``get_num_app`` 接口获取链接到内核的应用总数；
-- 第 10~12 行：依次对每个任务控制块进行初始化，将其运行状态设置为 ``Ready`` ，并在它的内核栈栈顶压入一些初始化
-  上下文，然后更新它的 ``task_cx`` 。一些细节我们会稍后介绍。
-- 从第 14 行开始：创建 ``TaskManager`` 实例并返回。
-
-.. note:: 
-
-    关于 Rust 迭代器语法如 ``iter_mut/(a..b)`` ，及其方法如 ``enumerate/map/find/take``，请参考 Rust 官方文档。
-
-实现 sys_yield 和 sys_exit
-----------------------------------------------------------------------------
-
-``sys_yield`` 的实现用到了 ``task`` 子模块提供的 ``suspend_current_and_run_next`` 接口，这个接口如字面含义，就是暂停当前的应用并切换到下个应用。
-
-.. code-block:: rust
-
-    // os/src/syscall/process.rs
-
-    use crate::task::suspend_current_and_run_next;
-
-    pub fn sys_yield() -> isize {
-        suspend_current_and_run_next();
-        0
-    }
-
-``sys_exit`` 基于 ``task`` 子模块提供的 ``exit_current_and_run_next`` 接口，它的含义是退出当前的应用并切换到下个应用：
-
-.. code-block:: rust
-
-    // os/src/syscall/process.rs
-
-    use crate::task::exit_current_and_run_next;
-
-    pub fn sys_exit(exit_code: i32) -> ! {
-        println!("[kernel] Application exited with code {}", exit_code);
-        exit_current_and_run_next();
-        panic!("Unreachable in sys_exit!");
-    }
-
-那么 ``suspend_current_and_run_next`` 和 ``exit_current_and_run_next`` 各是如何实现的呢？
-
-.. code-block:: rust
-
-    // os/src/task/mod.rs
-
-    pub fn suspend_current_and_run_next() {
-        TASK_MANAGER.mark_current_suspended();
-        TASK_MANAGER.run_next_task();
-    }
-
-    pub fn exit_current_and_run_next() {
-        TASK_MANAGER.mark_current_exited();
-        TASK_MANAGER.run_next_task();
-    }
-
-
-它们都是先修改当前应用的运行状态，然后尝试切换到下一个应用。修改运行状态比较简单，实现如下：
-
-.. code-block:: rust
-    :linenos:
-
-    // os/src/task/mod.rs
-
-    impl TaskManager {
-        fn mark_current_suspended(&self) {
-            let mut inner = self.inner.exclusive_access();
-            let current = inner.current_task;
-            inner.tasks[current].task_status = TaskStatus::Ready;
-        }
-    }
-
-以 ``mark_current_suspended`` 为例。首先获得里层 ``TaskManagerInner`` 的可变引用，然后修改任务控制块数组 ``tasks`` 中当前任务的状态。
-
-再看 ``run_next_task`` 的实现：
-
-.. code-block:: rust
-    :linenos:
-
-    // os/src/task/mod.rs
-
-    impl TaskManager {
-        fn run_next_task(&self) {
-            if let Some(next) = self.find_next_task() {
-                let mut inner = self.inner.exclusive_access();
-                let current = inner.current_task;
-                inner.tasks[next].task_status = TaskStatus::Running;
-                inner.current_task = next;
-                let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
-                let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
-                drop(inner);
-                // before this, we should drop local variables that must be dropped manually
-                unsafe {
-                    __switch(current_task_cx_ptr, next_task_cx_ptr);
+                use scause::*;
+                let finish = {
+                    ... => continue,
+                    ... => ...
+                };
+                if finish {
+                    tcb.finish = true;
+                    remain -= 1;
                 }
-                // go back to user mode
-            } else {
-                panic!("All applications completed!");
+                break;
             }
         }
-
-        fn find_next_task(&self) -> Option<usize> {
-            let inner = self.inner.exclusive_access();
-            let current = inner.current_task;
-            (current + 1..current + self.num_app + 1)
-                .map(|id| id % self.num_app)
-                .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
-        }
+        i = (i + 1) % index_mod;
     }
 
-``run_next_task`` 会调用 ``find_next_task`` 方法尝试寻找一个运行状态为 ``Ready`` 的应用并获得其 ID 。
-如果找不到， 说明所有应用都执行完了， ``find_next_task`` 将返回 ``None`` ，内核 panic 退出。
-如果能够找到下一个可运行应用，我们就调用 ``__switch`` 切换任务。
+- 第 2 行：记录还未结束的程序个数。
+- 第 4~6 行与 24 行：循环选择未结束的程序并运行
+- 第 8~9 行：设置时间中断（下一节介绍），先略过。
+- 第 13~21 行：检查当前程序运行状态，如走到 continue 分支则继续运行当前程序，否则暂停并运行下一个程序。并顺便标记当前程序是否结束。
 
-切换任务之前，我们要手动 drop 掉我们获取到的 ``TaskManagerInner`` 可变引用。
-因为函数还没有返回， ``inner`` 不会自动销毁。我们只有令 ``TASK_MANAGER`` 的 ``inner`` 字段回到未被借用的状态，下次任务切换时才能再借用。
-
-我们可以总结一下应用的运行状态变化图：
-
-.. image:: fsm-coop.png
-
-第一次进入用户态
-------------------------------------------
-
-我们在第二章中介绍过 CPU 第一次从内核态进入用户态的方法，只需在内核栈上压入构造好的 Trap 上下文，
-然后 ``__restore`` 即可。本章要在此基础上做一些扩展。
-
-在初始化任务控制块时，我们是这样做的：
-
-.. code-block:: rust
-
-    // os/src/task/mod.rs
-
-    for (i, t) in tasks.iter_mut().enumerate().take(num_app) {
-        t.task_cx = TaskContext::goto_restore(init_app_cx(i));
-        t.task_status = TaskStatus::Ready;
-    }
-
-``init_app_cx`` 在 ``loader`` 子模块中定义，它向内核栈压入了一个 Trap 上下文，并返回压入 Trap 上下文后 ``sp`` 的值。
-这个 Trap 上下文的构造方式与第二章相同。
-
-``goto_restore`` 保存传入的 ``sp``，并将 ``ra`` 设置为 ``__restore`` 的入口地址，构造任务上下文后返回。这样，任务管理器中各个应用的任务上下文就得到了初始化。
-
-.. code-block:: rust
-
-    // os/src/task/context.rs
-
-    impl TaskContext {
-        pub fn goto_restore(kstack_ptr: usize) -> Self {
-            extern "C" { fn __restore(); }
-            Self {
-                ra: __restore as usize,
-                sp: kstack_ptr,
-                s: [0; 12],
-            }
-        }
-    }
-
-在 ``rust_main`` 中我们调用 ``task::run_first_task`` 来执行第一个应用：
+而内层判断 ``finish`` 的部分如下：
 
 .. code-block:: rust
     :linenos:
 
-    // os/src/task/mod.rs
+    // ch3/src/main.rs
 
-    fn run_first_task(&self) -> ! {
-        let mut inner = self.inner.exclusive_access();
-        let task0 = &mut inner.tasks[0];
-        task0.task_status = TaskStatus::Running;
-        let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
-        drop(inner);
-        let mut _unused = TaskContext::zero_init();
-        // before this, we should drop local variables that must be dropped manually
-        unsafe {
-            __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
+    let finish = match scause::read().cause() {
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            tg_sbi::set_timer(u64::MAX);
+            log::trace!("app{i} timeout");
+            false
         }
-        panic!("unreachable in run_first_task!");
-    }
+        Trap::Exception(Exception::UserEnvCall) => {
+            use task::SchedulingEvent as Event;
+            match tcb.handle_syscall() {
+                Event::None => continue,
+                Event::Exit(code) => {
+                    log::info!("app{i} exit with code {code}");
+                    true
+                }
+                Event::Yield => {
+                    log::debug!("app{i} yield");
+                    false
+                }
+                Event::UnsupportedSyscall(id) => {
+                    log::error!("app{i} call an unsupported syscall {}", id.0);
+                    true
+                }
+            }
+        }
+        Trap::Exception(e) => {
+            log::error!("app{i} was killed by {e:?}");
+            true
+        }
+        Trap::Interrupt(ir) => {
+            log::error!("app{i} was killed by an unexpected interrupt {ir:?}");
+            true
+        }
+    };
 
-我们显式声明了一个 ``_unused`` 变量，并将它的地址作为第一个参数传给 ``__switch`` ，
-声明此变量的意义仅仅是为了避免其他数据被覆盖。
+- 第 4~8 行：触发时钟中断（下一节介绍），当前程序未结束，切换下一个程序。
+- 第 9~26 行：是系统调用，此时需通过 ``TaskControlBlock::handle_syscall()`` 完成系统调用并处理完成情况。注意此后的返回值 **都是任务控制块自己定义的返回值，不是 syscall 规范中的返回值** 。
+    - 第 12 行：系统调用正常完成，当前程序未结束，且继续运行。
+    - 第 13~16 行：已触发 ``sys_exit``，标记当前程序结束。
+    - 第 17~20 行：已触发 ``sys_sched_yield``，当前程序未结束，切换下一个程序。
+    - 第 21~24 行：遇到不支持的 syscall，标记当前程序结束。
+- 第 27~30 行：遇到异常，标记当前程序结束。
+- 第 31~34 行，遇到不支持的中断，标记当前程序结束。
 
-在 ``__switch`` 中恢复 ``sp`` 后， ``sp`` 将指向 ``init_app_cx`` 构造的 Trap 上下文，后面就回到第二章的情况了。
-此外， ``__restore`` 的实现需要做出变化：它 **不再需要** 在开头 ``mv sp, a0`` 了。因为在 ``__switch`` 之后，``sp`` 就已经正确指向了我们需要的 Trap 上下文地址。
+小结
+--------------------------------------
+
+我们首先通过任务控制块的包装，把加载进来的所有用户程序塞进一个数组里，然后通过实现了一个简易任务管理器，控制它们轮流运行。
+在运行过程中，用户程序可以调用 ``sys_sched_yield`` 来提示内核将当前任务暂时挂起，切换到其他任务执行。而内核则通过调度事件，将这一信息传递给上层的任务管理器，实现调度。
+
+但是，如果有程序完全不使用 ``sys_sched_yield`` ，就能长时间霸占 CPU 直到运行结束。
+有没有什么办法无需依赖主动的系统调用，而是让程序被动让出 CPU 呢？
+下一节我们将介绍上面几段代码中埋下的伏笔——时钟中断机制。
