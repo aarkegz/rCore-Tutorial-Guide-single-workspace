@@ -1,199 +1,276 @@
 # 基于地址空间的分时多任务
 
-## 概述
+## 本节导读
 
-本节我们介绍如何基于地址空间抽象来实现分时多任务系统。
+在前几节中，我们了解了如何创建内核和应用的地址空间。本节将介绍如何在独立地址空间之间进行切换，实现基于地址空间的分时多任务系统。
 
-## 建立并开启基于分页模式的虚拟地址空间
+## 从第三章到第四章：上下文的演变
 
-当 SBI 实现初始化完成后，CPU 将跳转到内核入口点并在 S 特权级上执行，此时还并没有开启分页模式，内核的每一次访存仍被视为一个物理地址直接访问物理内存。而在开启分页模式之后，内核的代码在访存的时候只能看到内核地址空间，此时每次访存将被视为一个虚拟地址且需要通过 MMU 基于内核地址空间的多级页表的地址转换。
+### 第三章：LocalContext
 
-### 创建内核地址空间
+在第三章中，所有任务共享同一个地址空间，上下文切换只需要保存/恢复寄存器：
 
-在 `ch4/src/main.rs` 的 `rust_main` 函数中，我们创建内核地址空间并启用分页：
+```rust
+// ch3/src/task.rs
+
+pub struct TaskControlBlock {
+    ctx: LocalContext,    // 本地上下文
+    pub finish: bool,
+    stack: [usize; 256],
+}
+
+// 执行任务
+pub unsafe fn execute(&mut self) {
+    self.ctx.execute();  // 直接执行，不涉及地址空间切换
+}
+```
+
+### 第四章：ForeignContext
+
+在第四章中，每个进程有独立的地址空间，切换时还需要切换页表：
+
+```rust
+// kernel-context/src/foreign/mod.rs
+
+/// 异界线程上下文。
+/// 不在当前地址空间的线程。
+pub struct ForeignContext {
+    /// 目标地址空间上的线程上下文。
+    pub context: LocalContext,
+    /// 目标地址空间的 satp 值。
+    pub satp: usize,
+}
+```
+
+`ForeignContext` 比 `LocalContext` 多了一个 `satp` 字段，用于记录目标地址空间的页表根节点。
+
+## 跨地址空间执行的挑战
+
+### 问题分析
+
+假设我们要从内核切换到应用执行，需要做以下事情：
+
+1. 保存内核的寄存器
+2. 切换页表（修改 `satp`）
+3. 恢复应用的寄存器
+4. `sret` 返回到应用态
+
+问题来了：**切换页表后，内核代码还能执行吗？**
+
+```
+执行流程：
+1. 内核代码在地址 0x80200100
+2. 执行 csrw satp, app_satp  ← 切换到应用页表
+3. 下一条指令在 0x80200104
+4. 但应用页表可能没有映射 0x80200100！
+   → CPU 找不到代码 → 异常！
+```
+
+### 解决方案：传送门
+
+传送门（Portal）是一段特殊的代码，它被同时映射到内核和应用的地址空间的相同虚拟地址上：
+
+```
+地址空间切换时的执行流程：
+
+内核代码 (0x80200xxx)
+    │
+    ↓ 跳转到传送门
+传送门代码 (0x7FFFFFFFFF000)  ← 在两个地址空间都有映射！
+    │ 切换 satp
+    │ sret
+    ↓
+应用代码 (0x10xxx)
+```
+
+## 传送门的实现
+
+### MultislotPortal
+
+`kernel-context` 库提供了 `MultislotPortal` 来管理传送门：
 
 ```rust
 // ch4/src/main.rs
+
+// 传送门所在虚页（最高虚拟页）
+const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;  // 0x7FFFFFF
 
 extern "C" fn rust_main() -> ! {
-    let layout = linker::KernelLayout::locate();
-    // bss 段清零
-    unsafe { layout.zero_bss() };
-    // 初始化 `console`
-    rcore_console::init_console(&Console);
-    rcore_console::set_log_level(option_env!("LOG"));
-    rcore_console::test_log();
-    // 初始化内核堆
-    kernel_alloc::init(layout.start() as _);
-    unsafe {
-        kernel_alloc::transfer(core::slice::from_raw_parts_mut(
-            layout.end() as _,
-            MEMORY - layout.len(),
-        ))
-    };
-    // 建立异界传送门
-    let portal_size = MultislotPortal::calculate_size(1);
+    // ...
+    
+    // 计算传送门需要的空间大小
+    let portal_size = MultislotPortal::calculate_size(1);  // 1 个插槽
     let portal_layout = Layout::from_size_align(portal_size, 1 << Sv39::PAGE_BITS).unwrap();
+    // 分配传送门的物理页
     let portal_ptr = unsafe { alloc(portal_layout) };
-    // 建立内核地址空间
+    
+    // 建立内核地址空间（会映射传送门）
     let mut ks = kernel_space(layout, MEMORY, portal_ptr as _);
+    
     // ...
 }
 ```
 
-`kernel_space()` 函数会：
-1. 创建新的地址空间
-2. 映射内核的各个段（代码段、数据段等）
-3. 映射堆空间
-4. 映射传送门
-5. 设置 `satp` CSR 启用分页模式
+### 传送门代码的工作原理
 
-### 启用分页模式
+传送门代码执行以下步骤：
 
-在 `kernel_space()` 函数的最后，我们设置 `satp` CSR：
+```asm
+// kernel-context/src/foreign/mod.rs (简化版)
 
-```rust
-// ch4/src/main.rs
+// 1. 保存当前状态到缓存
+sd    a1, 1*8(a0)           // 保存 a1
 
-unsafe { satp::set(satp::Mode::Sv39, 0, space.root_ppn().val()) };
+// 2. 切换地址空间
+ld    a1, 2*8(a0)           // 加载目标 satp
+csrrw a1, satp, a1          // 交换 satp
+sfence.vma                   // 刷新 TLB
+sd    a1, 2*8(a0)           // 保存原 satp
+
+// 3. 加载目标上下文
+ld    a1, 3*8(a0)           // 加载 sstatus
+csrw  sstatus, a1
+ld    a1, 4*8(a0)           // 加载 sepc
+csrw  sepc, a1
+
+// 4. 设置返回时的 trap 入口
+la    a1, 1f                // trap 入口就在后面
+csrrw a1, stvec, a1
+sd    a1, 5*8(a0)           // 保存原 stvec
+
+// 5. 恢复寄存器并进入用户态
+ld    a1, 1*8(a0)
+ld    a0, (a0)
+sret                        // 进入用户态！
+
+// ---- 用户态发生 trap 后回到这里 ----
+1:
+// 6. 保存用户寄存器
+csrrw a0, sscratch, a0
+sd    a1, 1*8(a0)
+
+// 7. 恢复内核地址空间
+ld    a1, 2*8(a0)
+csrrw a1, satp, a1
+sfence.vma
+sd    a1, 2*8(a0)
+
+// 8. 恢复内核上下文并返回
+ld    a1, 1*8(a0)
+ld    a0, 5*8(a0)
+csrw  stvec, a0
+jr    a0                    // 跳回内核的 trap 处理
 ```
 
-这行代码会：
-1. 将 `satp` 的 `MODE` 字段设置为 `Sv39`（值为 8）
-2. 将 `PPN` 字段设置为页表根节点的物理页号
-3. 从这一刻开始，SV39 分页模式就被启用了
+## 调度流程
 
-在设置 `satp` 之后，我们还需要使用 `sfence.vma` 指令清空 TLB（快表），以确保地址转换能够及时与 `satp` 的修改同步。
+### 调度线程
 
-## 跨地址空间的上下文切换
-
-由于内核和应用程序拥有独立的地址空间，在 Trap 和任务切换时需要进行地址空间切换。在本项目的代码框架中，这通过 `ForeignContext` 来实现：
+在 `ch4/src/main.rs` 中，我们创建了一个专门的调度线程：
 
 ```rust
-// ch4/src/process.rs
-
-pub struct Process {
-    pub context: ForeignContext,
-    pub address_space: AddressSpace<Sv39, Sv39Manager>,
+extern "C" fn rust_main() -> ! {
+    // ... 初始化代码 ...
+    
+    // 建立调度栈
+    const PAGE: Layout = unsafe { 
+        Layout::from_size_align_unchecked(2 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS) 
+    };
+    let pages = 2;
+    let stack = unsafe { alloc(PAGE) };
+    ks.map_extern(
+        VPN::new((1 << 26) - pages)..VPN::new(1 << 26),
+        PPN::new(stack as usize >> Sv39::PAGE_BITS),
+        VmFlags::build_from_str("_WRV"),
+    );
+    
+    // 创建调度线程
+    let mut scheduling = LocalContext::thread(schedule as _, false);
+    *scheduling.sp_mut() = 1 << 38;  // 设置栈指针
+    
+    // 执行调度线程
+    unsafe { scheduling.execute() };
+    
+    // 如果调度线程因异常返回，说明出错了
+    log::error!("stval = {:#x}", stval::read());
+    panic!("trap from scheduling thread: {:?}", scause::read().cause());
 }
 ```
 
-`ForeignContext` 包含：
-- `context`：`LocalContext`，保存了通用寄存器和程序计数器
-- `satp`：地址空间的 token（用于设置 `satp` CSR）
+**为什么需要调度线程？**
 
-### 执行进程
+调度线程将内核的异常域与应用的异常域分离。如果在调度循环中发生内核异常，会返回到 `rust_main` 中处理，而不是影响到应用的执行。
 
-在 `ch4/src/main.rs` 的 `schedule()` 函数中，我们使用 `ForeignContext::execute()` 来执行进程：
+### 调度循环
 
 ```rust
-// ch4/src/main.rs
-
 extern "C" fn schedule() -> ! {
-    // 初始化异界传送门
+    // 1. 初始化传送门
     let portal = unsafe { MultislotPortal::init_transit(PROTAL_TRANSIT.base().val(), 1) };
-    // 初始化 syscall
-    // ...
-    while !unsafe { PROCESSES.get_mut().is_empty() } {
-        let ctx = unsafe { &mut PROCESSES.get_mut()[0].context };
-        unsafe { ctx.execute(portal, ()) };
-        // 处理 Trap...
-    }
-}
-```
-
-`ForeignContext::execute()` 会：
-1. 切换到进程的地址空间（设置 `satp`）
-2. 恢复进程的上下文
-3. 通过 `sret` 指令返回到用户态执行
-
-当发生 Trap 时，硬件会：
-1. 保存当前状态到 CSR
-2. 跳转到 `stvec` 指向的 Trap 处理入口
-3. 在 Trap 处理入口，会切换到内核地址空间
-
-## 传送门（Portal）机制
-
-传送门是用于跨地址空间切换的特殊机制。在本章中，我们使用 `MultislotPortal` 来实现：
-
-```rust
-// ch4/src/main.rs
-
-// 建立异界传送门
-let portal_size = MultislotPortal::calculate_size(1);
-let portal_layout = Layout::from_size_align(portal_size, 1 << Sv39::PAGE_BITS).unwrap();
-let portal_ptr = unsafe { alloc(portal_layout) };
-```
-
-传送门被映射到内核和应用地址空间的最高虚拟页面，这样在执行地址空间切换的代码时，无论当前在哪个地址空间，都能访问到这段代码。
-
-## 加载和执行应用程序
-
-### 进程创建
-
-在 `ch4/src/process.rs` 中，我们通过解析 ELF 文件来创建进程：
-
-```rust
-// ch4/src/process.rs
-
-impl Process {
-    pub fn new(elf: ElfFile) -> Option<Self> {
-        // 解析 ELF 入口点
-        let entry = // ...
+    
+    // 2. 初始化系统调用
+    syscall::init_io(&SyscallContext);
+    syscall::init_process(&SyscallContext);
+    syscall::init_scheduling(&SyscallContext);
+    syscall::init_clock(&SyscallContext);
+    
+    // 3. 调度循环
+    while !unsafe { PROCESSES.is_empty() } {
+        // 获取第一个进程
+        let ctx = unsafe { &mut PROCESSES[0].context };
         
-        // 创建地址空间并映射 ELF 段
-        let mut address_space = AddressSpace::new();
-        for program in elf.program_iter() {
-            // 映射程序段
-        }
-        
-        // 映射用户栈
-        // ...
-        
-        // 创建上下文
-        let mut context = LocalContext::user(entry);
-        let satp = (8 << 60) | address_space.root_ppn().val();
-        *context.sp_mut() = 1 << 38;
-        
-        Some(Self {
-            context: ForeignContext { context, satp },
-            address_space,
-        })
-    }
-}
-```
-
-### 进程调度
-
-在 `schedule()` 函数中，我们实现了简单的轮询调度：
-
-```rust
-// ch4/src/main.rs
-
-extern "C" fn schedule() -> ! {
-    // ...
-    while !unsafe { PROCESSES.get_mut().is_empty() } {
-        let ctx = unsafe { &mut PROCESSES.get_mut()[0].context };
+        // 执行进程（会切换地址空间！）
         unsafe { ctx.execute(portal, ()) };
         
+        // 处理 trap
         match scause::read().cause() {
             scause::Trap::Exception(scause::Exception::UserEnvCall) => {
-                // 处理系统调用
-                // ...
+                // 系统调用处理
+                use syscall::{SyscallId as Id, SyscallResult as Ret};
+
+                let ctx = &mut ctx.context;
+                let id: Id = ctx.a(7).into();
+                let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                
+                match syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
+                    Ret::Done(ret) => match id {
+                        Id::EXIT => unsafe {
+                            PROCESSES.remove(0);  // 进程退出
+                        },
+                        _ => {
+                            *ctx.a_mut(0) = ret as _;  // 设置返回值
+                            ctx.move_next();           // 移动到下一条指令
+                        }
+                    },
+                    Ret::Unsupported(_) => {
+                        log::info!("id = {id:?}");
+                        unsafe { PROCESSES.remove(0) };  // 不支持的系统调用
+                    }
+                }
             }
             e => {
-                // 处理异常
-                unsafe { PROCESSES.get_mut().remove(0) };
+                // 其他异常（页错误等）
+                log::error!(
+                    "unsupported trap: {e:?}, stval = {:#x}, sepc = {:#x}",
+                    stval::read(),
+                    ctx.context.pc()
+                );
+                unsafe { PROCESSES.remove(0) };  // 终止进程
             }
         }
     }
-    sbi::shutdown(false)
+    
+    // 所有进程结束，关机
+    system_reset(Shutdown, NoReason);
+    unreachable!()
 }
 ```
 
 ## 系统调用处理
 
-由于地址空间隔离，系统调用处理需要特别注意跨地址空间访问。例如，`sys_write` 需要手动查页表来访问应用程序的缓冲区：
+### 跨地址空间访问用户数据
+
+由于内核和应用使用不同的地址空间，系统调用处理时需要特别注意地址翻译：
 
 ```rust
 // ch4/src/main.rs (impls 模块)
@@ -202,13 +279,16 @@ impl IO for SyscallContext {
     fn write(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
         match fd {
             STDOUT | STDDEBUG => {
+                // buf 是应用的虚拟地址，不能直接使用！
                 const READABLE: VmFlags<Sv39> = VmFlags::build_from_str("RV");
-                if let Some(ptr) = unsafe { PROCESSES.get_mut() }
-                    .get_mut(caller.entity)
+                
+                // 需要通过应用的页表进行地址翻译
+                if let Some(ptr) = unsafe { PROCESSES.get_mut(caller.entity) }
                     .unwrap()
                     .address_space
                     .translate(VAddr::new(buf), READABLE)
                 {
+                    // ptr 现在是内核可以访问的指针
                     print!("{}", unsafe {
                         core::str::from_utf8_unchecked(core::slice::from_raw_parts(
                             ptr.as_ptr(),
@@ -217,21 +297,135 @@ impl IO for SyscallContext {
                     });
                     count as _
                 } else {
+                    log::error!("ptr not readable");
                     -1
                 }
             }
-            // ...
+            _ => {
+                log::error!("unsupported fd: {fd}");
+                -1
+            }
         }
     }
 }
 ```
 
+### clock_gettime 系统调用
+
+同样需要地址翻译：
+
+```rust
+impl Clock for SyscallContext {
+    fn clock_gettime(&self, caller: Caller, clock_id: ClockId, tp: usize) -> isize {
+        // tp 是应用提供的指针，需要翻译
+        const WRITABLE: VmFlags<Sv39> = VmFlags::build_from_str("W_V");
+        
+        match clock_id {
+            ClockId::CLOCK_MONOTONIC => {
+                if let Some(mut ptr) = unsafe { PROCESSES.get(caller.entity) }
+                    .unwrap()
+                    .address_space
+                    .translate(VAddr::new(tp), WRITABLE)  // 检查可写权限
+                {
+                    let time = riscv::register::time::read() * 10000 / 125;
+                    *unsafe { ptr.as_mut() } = TimeSpec {
+                        tv_sec: time / 1_000_000_000,
+                        tv_nsec: time % 1_000_000_000,
+                    };
+                    0
+                } else {
+                    log::error!("ptr not writable");
+                    -1
+                }
+            }
+            _ => -1,
+        }
+    }
+}
+```
+
+## 异常处理
+
+### 页错误
+
+当应用访问未映射或权限不足的地址时，会触发页错误：
+
+```rust
+// 调度循环中的异常处理
+e => {
+    log::error!(
+        "unsupported trap: {e:?}, stval = {:#x}, sepc = {:#x}",
+        stval::read(),  // 触发异常的地址
+        ctx.context.pc() // 触发异常的指令地址
+    );
+    unsafe { PROCESSES.remove(0) };  // 终止进程
+}
+```
+
+常见的页错误类型：
+- `LoadPageFault`：读取未映射或不可读的地址
+- `StorePageFault`：写入未映射或不可写的地址
+- `InstructionPageFault`：执行未映射或不可执行的地址
+
+## 与第三章的对比
+
+| 特性 | 第三章 | 第四章 |
+|------|--------|--------|
+| 上下文类型 | `LocalContext` | `ForeignContext` |
+| 执行方式 | `ctx.execute()` | `ctx.execute(portal, key)` |
+| 地址空间切换 | 无 | 通过传送门自动切换 |
+| 系统调用访问用户数据 | 直接使用指针 | 需要 `translate()` |
+| 异常处理 | 直接使用 `stval` | 检查是否为页错误 |
+| 调度方式 | 主函数循环 | 独立的调度线程 |
+
+## 执行流程总结
+
+```
+                         rust_main
+                             │
+                             ↓
+                    初始化内核地址空间
+                    加载应用程序
+                             │
+                             ↓
+                       schedule()
+                             │
+        ┌────────────────────┼────────────────────┐
+        ↓                    ↓                    ↓
+    Process 0            Process 1           Process N
+        │                    │                    │
+        ↓                    ↓                    ↓
+  ctx.execute()        ctx.execute()        ctx.execute()
+        │                    │                    │
+        ↓                    ↓                    ↓
+   [传送门]              [传送门]             [传送门]
+   切换satp              切换satp             切换satp
+        │                    │                    │
+        ↓                    ↓                    ↓
+   用户态执行            用户态执行           用户态执行
+        │                    │                    │
+      trap               trap                 trap
+        │                    │                    │
+        ↓                    ↓                    ↓
+   [传送门]              [传送门]             [传送门]
+   恢复satp              恢复satp             恢复satp
+        │                    │                    │
+        └────────────────────┼────────────────────┘
+                             ↓
+                     处理 trap/系统调用
+                             │
+                             ↓
+                      继续调度循环
+```
+
 ## 关键概念总结
 
-1. **地址空间切换**：在 Trap 和任务切换时需要切换地址空间
-2. **ForeignContext**：用于跨地址空间的上下文切换
-3. **传送门机制**：用于在地址空间切换时执行代码的特殊机制
-4. **ELF 解析**：通过解析 ELF 文件来创建应用地址空间
-5. **跨地址空间访问**：内核需要手动查页表来访问应用程序的数据
+| 概念 | 说明 |
+|------|------|
+| ForeignContext | 跨地址空间的上下文，包含 satp |
+| MultislotPortal | 传送门，用于地址空间切换 |
+| 调度线程 | 专门的线程，分离内核和应用的异常域 |
+| 地址翻译 | 系统调用时将用户虚拟地址转为内核可访问的地址 |
+| 页错误 | 访问未映射或权限不足的地址时触发 |
 
-通过这些机制，我们实现了基于地址空间的分时多任务系统，为每个应用程序提供了安全隔离的执行环境。
+至此，我们实现了一个基于虚拟内存的分时多任务操作系统。每个应用程序都运行在独立的地址空间中，彼此隔离，安全性大大提高。
