@@ -51,7 +51,6 @@
 在 qemu 模拟器上运行本章代码：
 
 ```bash
-$ cd rCore-Tutorial-in-single-workspace
 $ cargo qemu --ch 4
 ```
 
